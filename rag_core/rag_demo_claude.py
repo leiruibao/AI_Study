@@ -4,6 +4,12 @@ RAG智能问答系统 - 基于LlamaIndex + DeepSeek + 本地Embedding
 """
 
 import os
+import shutil
+from pathlib import Path
+#os.environ["HF_HUB_OFFLINE"] = "1"
+# 2. 关键：改用国内镜像站
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+os.environ["HF_HOME"] = r"F:\AI_Models\huggingface"
 from urllib import response
 import tiktoken
 from llama_index.core import (
@@ -22,6 +28,7 @@ from llama_index.readers.file import PyMuPDFReader
 #from llama_index.core import Settings
 from llama_index.core.chat_engine import CondensePlusContextChatEngine
 from llama_index.core.memory import ChatMemoryBuffer
+
 
 
 # ==================== 配置区 ====================
