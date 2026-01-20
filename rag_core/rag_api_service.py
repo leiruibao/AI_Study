@@ -5,6 +5,7 @@ RAG智能问答系统 - FastAPI 微服务版本
 """
 
 import os
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 import asyncio
 from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
