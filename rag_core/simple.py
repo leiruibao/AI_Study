@@ -7,7 +7,7 @@
 import os
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from llama_index.core import (
@@ -18,8 +18,9 @@ from llama_index.core import (
     load_index_from_storage,
 )
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-from llama_index.llms.openai import OpenAI
 from llama_index.llms.openai_like import OpenAILike
+
+from llama_index.core.llms import ChatMessage
 
 # ==================== 配置参数 ====================
 # 这里集中管理所有配置，方便修改
@@ -32,6 +33,9 @@ EMBED_MODEL = "BAAI/bge-base-zh-v1.5"  # 中文向量模型
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_PATH = os.path.join(BASE_DIR, "data")       # 放文档的文件夹
 STORAGE_PATH = os.path.join(BASE_DIR, "storage") # 索引保存位置
+
+DATA_BASE_PATH = os.path.join(BASE_DIR, "data")
+STORAGE_BASE_PATH = os.path.join(BASE_DIR, "storage")
 
 
 # ==================== 请求和响应的数据结构 ====================
@@ -47,7 +51,7 @@ class QueryResponse(BaseModel):
     answer: str  # AI的回答
 
 
-# ==================== 全局变量 ====================
+# ==================== 全局变量：改为字典映射 ====================
 # 用来存储已经加载好的索引，避免重复加载
 
 index = None  # 向量索引（用于检索文档）
@@ -284,6 +288,35 @@ async def query(request: QueryRequest):
     except Exception as e:
         # 如果出错，返回错误信息
         raise HTTPException(status_code=500, detail=f"查询失败: {str(e)}")
+
+
+@app.post("/mentor-chat")
+async def mentor_chat(request: Request):
+    data = await request.json()
+    q_id = data.get("qId")
+    user_query = data.get("query")
+    history_data = data.get("history", [])  # 前端传来的对话数组
+
+    # 1. 将前端传来的 history 转换为 LlamaIndex 需要的 ChatMessage 对象
+    chat_history = []
+    for msg in history_data:
+        role = "user" if msg["role"] == "user" else "assistant"
+        chat_history.append(ChatMessage(role=role, content=msg["content"]))
+
+    # 2. 创建一个上下文对话引擎
+    # context_template 可以告诉 AI 它的身份
+    chat_engine = index.as_chat_engine(
+        chat_mode="context",
+        system_prompt=(
+            "你是一名资深的法考导师。你现在的任务是根据提供的法律案例背景，"
+            "回答学生针对该案例的追问。你的回答要专业、严谨，并多引用案例中的事实。"
+        ),
+    )
+
+    # 3. 发起对话（传入历史，AI 就能记住之前聊过什么）
+    response = chat_engine.chat(user_query, chat_history=chat_history)
+
+    return {"answer": response.response}
 
 
 # ==================== 启动服务 ====================
