@@ -59,7 +59,7 @@ def init_system():
         api_key=DEEPSEEK_API_KEY,
         api_base="https://api.deepseek.com/v1",
         is_chat_model=True,
-        temperature=0.3,
+        temperature=1,
         context_window=64000
     )
 
@@ -82,14 +82,14 @@ def load_index_for_subject(subject_name: str):
     subject_storage_path = os.path.join(STORAGE_BASE_PATH, subject_name)
 
     # 确保文件夹存在
-    os.makedirs(subject_data_path, exist_ok=True)
+    os.makedirs(subject_data_path, exist_ok=True) # 如果目录链中有不存在的文件夹则会自动创建，True代表存在的话不会报错
     os.makedirs(subject_storage_path, exist_ok=True)
 
     # 尝试加载
     if os.path.exists(subject_storage_path) and os.listdir(subject_storage_path):
         print(f"📂 正在从磁盘加载【{subject_name}】索引...")
-        storage_context = StorageContext.from_defaults(persist_dir=subject_storage_path)
-        idx = load_index_from_storage(storage_context)
+        storage_context = StorageContext.from_defaults(persist_dir=subject_storage_path) # StorageContext 是 LlamaIndex 库里的一个“配置管家”
+        idx = load_index_from_storage(storage_context) # 
     else:
         # 如果没有索引则构建
         print(f"📚 正在为【{subject_name}】构建新索引...")
@@ -97,10 +97,11 @@ def load_index_for_subject(subject_name: str):
             print(f"⚠️  警告: 【{subject_name}】数据目录为空，创建空索引")
             idx = VectorStoreIndex.from_documents([])
         else:
-            reader = SimpleDirectoryReader(input_dir=subject_data_path)
-            documents = reader.load_data()
-            idx = VectorStoreIndex.from_documents(documents, show_progress=True)
-            idx.storage_context.persist(persist_dir=subject_storage_path)
+            # 本地文档变成 AI 能懂的数据库
+            reader = SimpleDirectoryReader(input_dir=subject_data_path) # 找搬运工。实例化一个扫描器，瞄准存放文档的文件夹
+            documents = reader.load_data() # 搬货上车。把 PDF/Word/TXT 等原始文件读进内存，变成代码能处理的通用格式。
+            idx = VectorStoreIndex.from_documents(documents, show_progress=True) # 切碎并索引（核心步骤）。把文档切成小块（Chunk），计算特征值（Embedding），做成类似字典的“索引书架”。
+            idx.storage_context.persist(persist_dir=subject_storage_path) # 存入仓库。把内存里做好的索引保存到硬盘，下次启动直接读，不用再重复前三步。
 
     index_map[subject_name] = idx
     return idx
@@ -137,7 +138,7 @@ async def lifespan(app: FastAPI):
     print("🛑 服务关闭中...")
 
 
-app = FastAPI(title="法考 RAG 多学科 API", lifespan=lifespan)
+app = FastAPI(title="RAG 多学科 API", lifespan=lifespan) # lifespan：函数名。你可以起名叫 startup_and_shutdown，但在 FastAPI 里约定俗成叫 lifespan（生命周期）。
 
 
 # ==================== API 接口 ====================
@@ -230,7 +231,6 @@ async def mentor_chat_stream(request: Request):
         chat_history.append(ChatMessage(role=role, content=msg["content"]))
 
     # 2. 【核心改动】极简系统提示词
-    # 我们不再硬编码“你是一位严谨的法考导师”，而是告诉 AI：
     # “请严格执行用户 Prompt 中设定的专家角色和批改逻辑。”
     minimal_system_prompt = (
         "你是一个高度专业的 AI 助手。请根据下方提供的【批改标准与身份设定】，"
@@ -255,4 +255,4 @@ async def mentor_chat_stream(request: Request):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000) # host="0.0.0.0"：全网监听。不仅仅本机 127.0.0.1 能访问，局域网里的 Java 后端或其他机器也能通过 IP 找到它。
