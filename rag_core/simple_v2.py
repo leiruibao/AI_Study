@@ -19,12 +19,14 @@ from llama_index.core import (
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.llms.openai_like import OpenAILike
 from llama_index.core.llms import ChatMessage
+from llama_index.postprocessor.flag_embedding_reranker import FlagEmbeddingReranker
 
 # ==================== 配置参数 ====================
 
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 DEEPSEEK_MODEL = "deepseek-chat"
 EMBED_MODEL = "BAAI/bge-base-zh-v1.5"
+RERANKER_MODEL = "BAAI/bge-reranker-base"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_BASE_PATH = os.path.join(BASE_DIR, "data")
@@ -33,6 +35,7 @@ STORAGE_BASE_PATH = os.path.join(BASE_DIR, "storage")
 # ==================== 全局状态：学科索引映射 ====================
 # key: 学科标识 (如 crim), value: 对应的 VectorStoreIndex 对象
 index_map = {}
+reranker = None  # 全局重排序器实例
 
 
 # ==================== 请求和响应的数据结构 ====================
@@ -70,6 +73,13 @@ def init_system():
 
     Settings.chunk_size = 512
     Settings.chunk_overlap = 50
+
+    global reranker
+    print("🔧 正在初始化重排序模型...")
+    reranker = FlagEmbeddingReranker(
+        model=RERANKER_MODEL,
+        top_n=3  # 重排序后最终保留3条最相关文档
+    )
     print("✅ 全局配置初始化完成")
 
 
@@ -165,52 +175,26 @@ async def query(request: QueryRequest):
     try:
         if request.stream:
             def generate():
-                query_engine = current_index.as_query_engine(streaming=True, similarity_top_k=3)
+                # 初筛10条 -> 重排序选3条
+                query_engine = current_index.as_query_engine(
+                    streaming=True, 
+                    similarity_top_k=10,
+                    node_postprocessors=[reranker]
+                )
                 response = query_engine.query(request.query)
                 for token in response.response_gen:
                     yield token
 
             return StreamingResponse(generate(), media_type="text/plain")
         else:
-            query_engine = current_index.as_query_engine(similarity_top_k=3)
+            query_engine = current_index.as_query_engine(
+                similarity_top_k=10,
+                node_postprocessors=[reranker]
+            )
             response = query_engine.query(request.query)
             return QueryResponse(answer=str(response))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/mentor-chat")
-async def mentor_chat(request: Request):
-    """导师对话接口：带历史记忆和学科背景"""
-    data = await request.json()
-    subject_code = data.get("subject", "default")
-    user_query = data.get("query")
-    history_data = data.get("history", [])
-
-    # 获取索引
-    if subject_code not in index_map:
-        # 如果没加载过则尝试加载
-        current_index = load_index_for_subject(subject_code)
-    else:
-        current_index = index_map[subject_code]
-
-    # 转换历史格式
-    chat_history = []
-    for msg in history_data:
-        role = "user" if msg["role"] == "user" else "assistant"
-        chat_history.append(ChatMessage(role=role, content=msg["content"]))
-
-    # 创建对话引擎
-    chat_engine = current_index.as_chat_engine(
-        chat_mode="context",
-        system_prompt=(
-            f"你是一名资深的【{subject_code}】专家导师。请根据提供的文档背景回答学生的问题。"
-            "回答要专业严谨，多引用背景材料中的事实。"
-        )
-    )
-
-    response = chat_engine.chat(user_query, chat_history=chat_history)
-    return {"answer": response.response}
 
 
 @app.post("/mentor-chat-stream")
@@ -231,15 +215,15 @@ async def mentor_chat_stream(request: Request):
         chat_history.append(ChatMessage(role=role, content=msg["content"]))
 
     # 2. 【核心改动】极简系统提示词
-    # “请严格执行用户 Prompt 中设定的专家角色和批改逻辑。”
     minimal_system_prompt = (
-        "你是一个高度专业的 AI 助手。请根据下方提供的【批改标准与身份设定】，"
-        "结合参考资料，以该专家的口吻与学生进行深度复盘。"
+        ""
     )
 
     # 3. 创建对话引擎
     chat_engine = index.as_chat_engine(
         chat_mode="context",
+        similarity_top_k=10,
+        node_postprocessors=[reranker],
         system_prompt=minimal_system_prompt
     )
 
