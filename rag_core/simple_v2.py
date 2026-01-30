@@ -20,6 +20,7 @@ from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.llms.openai_like import OpenAILike
 from llama_index.core.llms import ChatMessage
 from llama_index.postprocessor.flag_embedding_reranker import FlagEmbeddingReranker
+from llama_index.core import PromptTemplate
 
 # ==================== 配置参数 ====================
 
@@ -148,7 +149,15 @@ async def lifespan(app: FastAPI):
     print("🛑 服务关闭中...")
 
 
-app = FastAPI(title="RAG 多学科 API", lifespan=lifespan) # lifespan：函数名。你可以起名叫 startup_and_shutdown，但在 FastAPI 里约定俗成叫 lifespan（生命周期）。
+app = FastAPI(title="LawMaster RAG API", lifespan=lifespan) # lifespan：函数名。你可以起名叫 startup_and_shutdown，但在 FastAPI 里约定俗成叫 lifespan（生命周期）。
+
+# ==================== 统一后的请求模型 ====================
+class AIChatRequest(BaseModel):
+    query: str
+    subject: str = "default"
+    history: list = []
+    isConcise: bool = False
+    stream: bool = True
 
 
 # ==================== API 接口 ====================
@@ -158,44 +167,91 @@ async def root():
     return {"loaded_subjects": list(index_map.keys()), "status": "running"}
 
 
-@app.post("/query")
-async def query(request: QueryRequest):
-    """问答接口：支持学科路由"""
-    # 1. 获取学科索引（如果预热没加载到，这里会动态尝试加载）
+@app.post("/ai/grade/stream")
+async def ai_grade_stream(request: AIChatRequest):
     subject = request.subject if request.subject in index_map else "default"
-    if subject not in index_map:
-        # 尝试动态加载（比如运行期间新加了文件夹）
-        try:
-            current_index = load_index_for_subject(request.subject)
-        except:
-            raise HTTPException(status_code=404, detail=f"学科库 {request.subject} 不存在")
-    else:
-        current_index = index_map[subject]
+    current_index = index_map.get(subject)
 
-    try:
-        if request.stream:
-            def generate():
-                # 初筛10条 -> 重排序选3条
-                query_engine = current_index.as_query_engine(
-                    streaming=True, 
-                    similarity_top_k=10,
-                    node_postprocessors=[reranker]
-                )
-                response = query_engine.query(request.query)
-                for token in response.response_gen:
-                    yield token
+    # 定义 QA 模板，强制要求 Markdown
+    qa_prompt_tmpl_str = (
+        "上下文信息如下：\n"
+        "---------------------\n"
+        "{context_str}\n"
+        "---------------------\n"
+        "请结合上下文和你的专业知识回答问题：{query_str}\n\n"
+        "### 回答要求（必须遵守）：###\n"
+        "1. 使用标准 Markdown 格式回复。\n"
+        "2. 使用 **加粗标题** 区分模块。\n"
+        "3. 必须使用 \\n\\n 进行清晰的分段。\n"
+        "4. 使用 - 或 • 进行列表排版。\n"
+        "5. 给出明确的【得分预测】。"
+    )
+    qa_prompt_tmpl = PromptTemplate(qa_prompt_tmpl_str)
 
-            return StreamingResponse(generate(), media_type="text/plain")
-        else:
-            query_engine = current_index.as_query_engine(
-                similarity_top_k=10,
-                node_postprocessors=[reranker]
-            )
-            response = query_engine.query(request.query)
-            return QueryResponse(answer=str(response))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    def generate():
+        query_engine = current_index.as_query_engine(
+            streaming=True,
+            similarity_top_k=5,
+            node_postprocessors=[reranker],
+        )
+        # 🔥 在这里更新模板，而不是在 as_query_engine 里传 system_prompt
+        query_engine.update_prompts(
+            {"response_synthesizer:text_qa_template": qa_prompt_tmpl}
+        )
 
+        full_response_content = ""
+        response = query_engine.query(request.query)
+        for token in response.response_gen:
+            full_response_content += token
+            # 2. 转义换行符，确保它变成一行普通的文本
+            escaped_token = token.replace("\n", "[NEWLINE_TOKEN]")
+
+            yield f"data:{escaped_token}\n\n"
+        print("--- AI批改：完整生成结果 (服务端调试) ---")
+        print(full_response_content)
+        print("--------------------------------")
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
+
+@app.post("/ai/mentor-chat/stream")
+async def ai_mentor_chat_stream(request: AIChatRequest):
+    """
+    统一接口：AI 导师多轮对话（流式）
+    """
+    subject = request.subject if request.subject in index_map else "default"
+    current_index = index_map.get(subject)
+
+    # 转换历史记录格式
+    chat_history = [
+        ChatMessage(role=("user" if m["role"] == "user" else "assistant"), content=m["content"])
+        for m in request.history[:-1]
+    ]
+
+    minimal_system_prompt = (
+        "请务必使用标准 Markdown 格式回复，必须包含：\n"
+          "1. 使用 **加粗标题**\n"
+          "2. 使用 \n\n 进行分段\n"
+          "3. 使用 - 或 • 进行列表排版。"
+    )
+
+    chat_engine = current_index.as_chat_engine(
+        chat_mode="context",
+        similarity_top_k=10,
+        node_postprocessors=[reranker],
+        system_prompt=minimal_system_prompt
+    )
+
+    def generate():
+        response = chat_engine.stream_chat(request.query, chat_history=chat_history)
+        full_response_content = ""
+        for token in response.response_gen:
+            full_response_content += token
+            yield f"data: {token}\n\n"
+        print("--- 导师对话：完整生成结果 (服务端调试) ---")
+        print(full_response_content)
+        print("--------------------------------")
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
 
 @app.post("/mentor-chat-stream")
 async def mentor_chat_stream(request: Request):
@@ -216,7 +272,10 @@ async def mentor_chat_stream(request: Request):
 
     # 2. 【核心改动】极简系统提示词
     minimal_system_prompt = (
-        ""
+        "请务必使用标准 Markdown 格式回复，必须包含：\n"
+          "1. 使用 **加粗标题**\n"
+          "2. 使用 \n\n 进行分段\n"
+          "3. 使用 - 或 • 进行列表排版。"
     )
 
     # 3. 创建对话引擎
@@ -230,11 +289,16 @@ async def mentor_chat_stream(request: Request):
     def generate():
         # 注意：这里的 query 包含了 Java 侧 String.format 后的所有信息
         response = chat_engine.stream_chat(query, chat_history=chat_history)
+        full_response_content = ""
         for token in response.response_gen:
-            # 这里的 \n\n 是 SSE 协议要求的格式
+            full_response_content += token
             yield f"data: {token}\n\n"
+        print("--- 完整生成结果 (服务端调试) ---")
+        print(full_response_content)
+        print("--------------------------------")
 
     return StreamingResponse(generate(), media_type="text/event-stream")
+
 
 if __name__ == "__main__":
     import uvicorn
